@@ -31,6 +31,36 @@ export interface TermRule {
   createdAt: number;
 }
 
+export type RecallStatus = 'pending' | 'conflict';
+
+export interface RecallRequest {
+  id: string;
+  segmentId: string;
+  sequence: number;
+  baseRevision: number;
+  previousText: string;
+  replacementText: string;
+  reason: string;
+  requestedBy: string;
+  requestedAt: number;
+  queuedOffline: boolean;
+  status: RecallStatus;
+  conflictReason?: string;
+}
+
+export interface RecallRecord {
+  id: string;
+  segmentId: string;
+  sequence: number;
+  beforeText: string;
+  afterText: string;
+  reason: string;
+  requestedBy: string;
+  handledBy: string;
+  requestedAt: number;
+  handledAt: number;
+}
+
 export interface DeskModel {
   eventName: string;
   eventDate: string;
@@ -42,6 +72,9 @@ export interface DeskModel {
   fontSize: number;
   nextSequence: number;
   autoStream: boolean;
+  recallRequests: RecallRequest[];
+  recallRecords: RecallRecord[];
+  dutyOfficer: string;
   lastMergedAt?: number;
   updatedAt: number;
 }
@@ -115,6 +148,9 @@ export function createInitialModel(): DeskModel {
     fontSize: 18,
     nextSequence: 9,
     autoStream: true,
+    recallRequests: [],
+    recallRecords: [],
+    dutyOfficer: '值班校对员',
     updatedAt: now,
   };
 }
@@ -221,16 +257,127 @@ export function mergeConfirmedSegments(model: DeskModel): DeskModel {
   };
 }
 
+export const RECALL_WINDOW_MS = 90_000;
+
+function recallId(prefix: string): string {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+export function submitRecallRequest(
+  model: DeskModel,
+  segmentId: string,
+  replacementText: string,
+  reason: string,
+  requestedBy: string,
+  now = Date.now(),
+): { model: DeskModel; replaced: boolean } {
+  const segment = model.segments.find((item) => item.id === segmentId);
+  if (!segment) return { model, replaced: false };
+  const request: RecallRequest = {
+    id: recallId('recall-req'),
+    segmentId,
+    sequence: segment.sequence,
+    baseRevision: segment.revision,
+    previousText: segment.corrected,
+    replacementText,
+    reason,
+    requestedBy,
+    requestedAt: now,
+    queuedOffline: model.connection === 'offline',
+    status: 'pending',
+  };
+  // 同一片段只留一份待处理申请，新申请会替换旧的。
+  const rest = model.recallRequests.filter((item) => !(item.segmentId === segmentId && item.status === 'pending'));
+  return {
+    replaced: rest.length !== model.recallRequests.length,
+    model: { ...model, recallRequests: [request, ...rest], updatedAt: now },
+  };
+}
+
+export function resolveRecallConflict(request: RecallRequest, model: DeskModel, now = Date.now()): string | undefined {
+  const segment = model.segments.find((item) => item.id === request.segmentId);
+  if (!segment) return '原片段已不在队列中，保留当前直播内容';
+  const retracted = model.recallRecords.some((record) =>
+    record.segmentId === request.segmentId && record.handledAt >= request.requestedAt && record.beforeText === request.previousText);
+  if (retracted) return '该句在申请后已被撤回处理，保留当前直播内容';
+  if (segment.revision !== request.baseRevision) {
+    return `原句在申请后又被修改（版本 ${request.baseRevision} → ${segment.revision}），保留当前直播内容`;
+  }
+  if (now - request.requestedAt > RECALL_WINDOW_MS) {
+    return `申请已超过 90 秒（等待 ${Math.round((now - request.requestedAt) / 1000)} 秒），保留当前直播内容`;
+  }
+  return undefined;
+}
+
+export function approveRecallRequest(
+  model: DeskModel,
+  requestId: string,
+  handledBy: string,
+  now = Date.now(),
+): { model: DeskModel; record?: RecallRecord; conflict?: string } {
+  const request = model.recallRequests.find((item) => item.id === requestId);
+  if (!request || request.status !== 'pending') {
+    return { model, conflict: '申请不存在或已处理，保留当前直播内容' };
+  }
+  const conflict = resolveRecallConflict(request, model, now);
+  if (conflict) {
+    return {
+      conflict,
+      model: {
+        ...model,
+        recallRequests: model.recallRequests.map((item) => item.id === requestId ? { ...item, status: 'conflict' as const, conflictReason: conflict } : item),
+        updatedAt: now,
+      },
+    };
+  }
+  const segment = model.segments.find((item) => item.id === request.segmentId);
+  if (!segment) return { model, conflict: '原片段已不在队列中，保留当前直播内容' };
+  const record: RecallRecord = {
+    id: recallId('recall'),
+    segmentId: segment.id,
+    sequence: segment.sequence,
+    beforeText: segment.corrected,
+    afterText: request.replacementText,
+    reason: request.reason,
+    requestedBy: request.requestedBy,
+    handledBy,
+    requestedAt: request.requestedAt,
+    handledAt: now,
+  };
+  return {
+    record,
+    model: {
+      ...model,
+      // 新文本回到原时间位置：只替换文本，startTime 与排序保持不变。
+      segments: model.segments.map((item) => item.id === segment.id ? {
+        ...item,
+        corrected: request.replacementText,
+        revision: item.revision + 1,
+        tags: [...new Set([...item.tags, '撤回已替换'])],
+      } : item),
+      recallRequests: model.recallRequests.filter((item) => item.id !== requestId),
+      recallRecords: [record, ...model.recallRecords].slice(0, 50),
+      updatedAt: now,
+    },
+  };
+}
+
+export function dismissRecallRequest(model: DeskModel, requestId: string): DeskModel {
+  return { ...model, recallRequests: model.recallRequests.filter((item) => item.id !== requestId), updatedAt: Date.now() };
+}
+
 export function queueStats(model: DeskModel) {
   const pending = model.segments.filter((item) => item.state === 'pending');
   const stale = model.segments.filter((item) => item.state === 'stale');
   const duplicate = model.segments.filter((item) => item.state === 'duplicate');
   const offline = model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed');
+  const recallPending = model.recallRequests.filter((item) => item.status === 'pending');
   return {
     pending: pending.length,
     stale: stale.length,
     duplicate: duplicate.length,
     offline: offline.length,
+    recallPending: recallPending.length,
     backlog: pending.length + stale.length + duplicate.length + offline.length,
     oldestWaitSeconds: pending.length ? Math.max(...pending.map((item) => Math.round((Date.now() - item.receivedAt) / 1000))) : 0,
   };
