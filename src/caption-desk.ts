@@ -4,15 +4,22 @@ import {
   applyRules,
   cloneModel,
   createInitialModel,
+  decideRecall,
   mergeConfirmedSegments,
   normalizeNumbers,
+  pendingRecallForSegment,
   queueStats,
+  recallConflict,
+  RECALL_WINDOW_MS,
+  requeueOfflineRecalls,
   STORAGE_KEY,
   simulateLatency,
+  submitRecall,
   toSrt,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
+  type RecallRequest,
   type SegmentState,
   type ToastMessage,
 } from './model';
@@ -221,6 +228,73 @@ export class CaptionDesk extends LitElement {
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
 
+    .live-item-foot { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+    .live-item-foot cds-button { margin-left: auto; }
+    .live-item.recall-pending { border-left-color: #f1c21b; background: color-mix(in srgb, var(--cds-layer-02, #f4f4f4) 92%, #f1c21b 8%); }
+
+    .recall-mask {
+      position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,.55);
+      display: grid; place-items: center; padding: 28px;
+    }
+    .recall-dialog {
+      width: min(640px, 100%); max-height: 90vh; display: flex; flex-direction: column;
+      background: var(--cds-layer, #fff); border: 1px solid var(--cds-border-subtle, #e0e0e0);
+      box-shadow: 0 18px 48px rgba(0,0,0,.32);
+    }
+    .recall-dialog-wide { width: min(900px, 100%); }
+    .recall-head {
+      padding: 14px 16px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+      border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); background: var(--cds-layer-02, #f4f4f4);
+    }
+    .recall-head h3 { margin: 0; font-size: 14px; font-weight: 600; }
+    .recall-head p { margin: 4px 0 0; color: var(--cds-text-secondary, #525252); font-size: 10px; line-height: 1.5; }
+    .recall-body { padding: 14px 16px; overflow: auto; display: flex; flex-direction: column; gap: 12px; }
+    .recall-review-body { padding: 16px; gap: 18px; }
+    .recall-review-section h4 { margin: 0 0 10px; font-size: 12px; font-weight: 600; color: var(--cds-text-secondary, #525252); }
+    .recall-meta-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--cds-text-secondary, #525252); font-size: 11px; }
+    .recall-version { margin-left: auto; font: 500 10px/1 "IBM Plex Mono", monospace; color: #0f62fe; }
+    .recall-before { padding: 10px 12px; background: #fff1f1; border-left: 3px solid #da1e28; }
+    .recall-before span { color: #da1e28; font-size: 10px; font-weight: 600; }
+    .recall-before p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.5; }
+    .recall-reason cds-textarea { min-height: 72px; }
+    .recall-operator { max-width: 280px; }
+    .recall-conflict { padding: 9px 11px; background: #fff1f1; border-left: 3px solid #da1e28; color: #a2191f; font-size: 11px; line-height: 1.5; }
+    .recall-conflict.keep { background: #fff8e1; border-color: #f1c21b; color: #684e00; }
+    .recall-foot {
+      padding: 12px 16px; border-top: 1px solid var(--cds-border-subtle, #e0e0e0);
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      background: var(--cds-layer-02, #f4f4f4);
+    }
+    .recall-foot span { color: var(--cds-text-secondary, #525252); font-size: 10px; line-height: 1.4; }
+    .recall-foot > div { display: flex; gap: 8px; flex: 0 0 auto; }
+
+    .recall-card { background: var(--cds-layer, #fff); border: 1px solid var(--cds-border-subtle, #e0e0e0); margin-bottom: 10px; }
+    .recall-card.conflict { border-color: #ffb3b8; box-shadow: inset 3px 0 0 #da1e28; }
+    .recall-card-head { padding: 10px 12px; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .recall-order { display: flex; gap: 10px; align-items: flex-start; }
+    .order-no { width: 22px; height: 22px; flex: 0 0 auto; display: grid; place-items: center; background: #0f62fe; color: #fff; font: 600 11px/1 "IBM Plex Mono", monospace; }
+    .recall-card-head strong { font-size: 12px; }
+    .recall-card-head p { margin: 3px 0 0; color: var(--cds-text-secondary, #525252); font-size: 10px; line-height: 1.5; }
+    .recall-diff { display: grid; grid-template-columns: 1fr auto 1fr; gap: 10px; padding: 10px 12px; align-items: stretch; }
+    .recall-diff.small { font-size: 11px; }
+    .diff-before, .diff-after { padding: 8px 10px; min-width: 0; }
+    .diff-before { background: #fff1f1; }
+    .diff-after { background: #defbe6; }
+    .diff-after.kept { background: #f4f4f4; }
+    .diff-before span, .diff-after span { display: block; font-size: 9px; font-weight: 600; color: var(--cds-text-secondary, #525252); margin-bottom: 4px; }
+    .diff-before p, .diff-after p { margin: 0; font-size: calc(var(--caption-font-size) * .82); line-height: 1.45; word-break: break-word; }
+    .recall-diff.small p { font-size: 11px; }
+    .diff-arrow { align-self: center; color: var(--cds-text-secondary, #525252); font-size: 14px; }
+    .recall-reason-line { padding: 0 12px 10px; font-size: 11px; line-height: 1.5; }
+    .recall-card .recall-conflict { margin: 0 12px 10px; }
+    .recall-card-actions { padding: 10px 12px; border-top: 1px solid var(--cds-border-subtle, #e0e0e0); display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .recall-card-actions cds-text-input { width: 200px; }
+    .recall-card-actions > div { display: flex; gap: 8px; }
+    .recall-record { background: var(--cds-layer, #fff); border: 1px solid var(--cds-border-subtle, #e0e0e0); margin-bottom: 8px; }
+    .recall-record.conflict, .recall-record.dismissed { opacity: .92; }
+    .recall-record .recall-diff { padding: 8px 12px; }
+    .recall-empty { padding: 22px 16px; text-align: center; color: var(--cds-text-secondary, #525252); font-size: 11px; line-height: 1.6; border: 1px dashed var(--cds-border-subtle, #e0e0e0); }
+
     @media (max-width: 1280px) {
       .workspace { grid-template-columns: minmax(340px, .85fr) minmax(410px, 1fr) minmax(330px, .85fr); }
       .status-strip { grid-template-columns: 1.4fr repeat(4, minmax(100px, .55fr)); }
@@ -246,6 +320,11 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  @state() private recallModal: 'closed' | 'apply' | 'review' = 'closed';
+  @state() private recallTargetId?: string;
+  @state() private recallText = '';
+  @state() private recallReason = '';
+  @state() private reviewName = '';
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
@@ -273,7 +352,13 @@ export class CaptionDesk extends LitElement {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
+        if (parsed.segments?.length) {
+          return {
+            ...parsed,
+            recalls: parsed.recalls ?? [],
+            operatorName: parsed.operatorName ?? '值班校对',
+          };
+        }
       }
     } catch {
       // 损坏草稿会回退到演示数据。
@@ -486,13 +571,14 @@ export class CaptionDesk extends LitElement {
   }
 
   private mergeOffline(): void {
-    const merged = mergeConfirmedSegments(this.model);
+    const merged = requeueOfflineRecalls(mergeConfirmedSegments(this.model));
     this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
     this.future = [];
     this.model = merged;
     this.persist();
     const outboxCount = this.model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
-    this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+    const offlineRecalls = merged.recalls.filter((item) => item.status === 'pending').length;
+    this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源；${offlineRecalls} 份撤回申请已按提交先后顺序回到复核队列`);
   }
 
   private addRuleFromSelection(): void {
@@ -534,6 +620,74 @@ export class CaptionDesk extends LitElement {
     this.commit('删除术语规则', (current) => ({ ...current, rules: current.rules.filter((item) => item.id !== id) }));
   }
 
+  private openRecallApply(segmentId: string): void {
+    const segment = this.model.segments.find((item) => item.id === segmentId);
+    if (!segment) return;
+    if (segment.state !== 'confirmed') {
+      this.pushToast('warning', '只有直播区已确认字幕可以申请撤回', '请先确认该片段');
+      return;
+    }
+    const existing = pendingRecallForSegment(this.model, segmentId);
+    this.recallTargetId = segmentId;
+    this.recallText = existing?.replacement ?? segment.corrected;
+    this.recallReason = existing?.reason ?? '';
+    this.recallModal = 'apply';
+  }
+
+  private submitRecallRequest(): void {
+    const segment = this.model.segments.find((item) => item.id === this.recallTargetId);
+    const replacement = this.recallText.trim();
+    const reason = this.recallReason.trim();
+    if (!segment) return;
+    if (!replacement) {
+      this.pushToast('warning', '替换文本不能为空', '撤回申请需要给出新文本');
+      return;
+    }
+    if (replacement === segment.corrected) {
+      this.pushToast('warning', '替换文本与直播区当前内容一致', '没有需要撤回的差异');
+      return;
+    }
+    if (!reason) {
+      this.pushToast('warning', '请填写撤回原因', '复核员需要依据原因判断');
+      return;
+    }
+    const result = submitRecall(this.model, {
+      segmentId: segment.id,
+      replacement,
+      reason,
+      applicant: this.model.operatorName || '值班校对',
+    });
+    this.commit(result.replaced ? '撤回申请已更新' : '快速撤回已申请', () => result.model);
+    this.recallModal = 'closed';
+    this.recallTargetId = undefined;
+    this.pushToast(result.model.connection === 'offline' ? 'warning' : 'success',
+      result.replaced ? '同片段旧申请已被替换' : '撤回申请已进入复核队列',
+      result.model.connection === 'offline' ? '断线期间暂存，恢复后按提交先后顺序处理' : `第 ${segment.sequence} 段 · 直播区错句将在复核后替换`);
+  }
+
+  private openReview(): void {
+    this.reviewName = this.model.operatorName || '值班校对';
+    this.recallModal = 'review';
+  }
+
+  private approveRecall(recallId: string): void {
+    const recall = this.model.recalls.find((item) => item.id === recallId);
+    if (!recall) return;
+    const conflict = recallConflict(this.model, recall);
+    if (conflict) {
+      this.pushToast('error', '撤回冲突，未替换直播内容', conflict);
+      return;
+    }
+    this.commit('撤回通过，旧句已转入撤回记录', (current) => decideRecall(current, recallId, true, this.reviewName || '复核员'));
+  }
+
+  private keepLiveContent(recallId: string): void {
+    const recall = this.model.recalls.find((item) => item.id === recallId);
+    if (!recall) return;
+    const conflict = recallConflict(this.model, recall);
+    this.commit(conflict ? '撤回冲突已结案，保留当前直播内容' : '已拒绝撤回，保留直播内容', (current) => decideRecall(current, recallId, false, this.reviewName || '复核员'));
+  }
+
   private exportSrt(): void {
     const content = toSrt(this.model);
     if (!content) {
@@ -561,6 +715,11 @@ export class CaptionDesk extends LitElement {
   }
 
   private handleShortcut = (event: KeyboardEvent): void => {
+    if (event.key === 'Escape' && this.recallModal !== 'closed') {
+      this.recallModal = 'closed';
+      this.recallTargetId = undefined;
+      return;
+    }
     const modifier = event.metaKey || event.ctrlKey;
     if (modifier && event.key.toLocaleLowerCase() === 'z') {
       event.preventDefault();
@@ -735,13 +894,24 @@ export class CaptionDesk extends LitElement {
             <span>${confirmed.length} 段已确认</span>
           </div>
           <div class="live-timeline">
-            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
-              <article class="live-item">
+            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => {
+              const pendingRecall = pendingRecallForSegment(this.model, segment.id);
+              const recallConflictNow = pendingRecall ? recallConflict(this.model, pendingRecall) : undefined;
+              return html`
+              <article class="live-item ${pendingRecall ? 'recall-pending' : ''}">
                 <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
                 <p>${segment.corrected}</p>
-                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
+                <div class="live-item-foot">
+                  ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : html`<small>v${segment.revision}</small>`}
+                  ${pendingRecall
+                    ? html`<cds-tag type=${recallConflictNow ? 'red' : 'warm-gray'} size="sm">${recallConflictNow ? '撤回冲突待复核' : '撤回申请待复核'}</cds-tag>`
+                    : nothing}
+                  <cds-button kind="ghost" size="xs" @click=${() => this.openRecallApply(segment.id)}>
+                    ${pendingRecall ? '修改撤回申请' : '快速撤回'}
+                  </cds-button>
+                </div>
               </article>
-            `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
+            `;}) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
           </div>
           ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
         </section>
@@ -759,6 +929,149 @@ export class CaptionDesk extends LitElement {
             ` : html`<span>请选择片段以查看上下文。</span>`}
           </div>
         </section>
+      </div>
+    `;
+  }
+
+  private recallStatusLabel(status: RecallRequest['status']): string {
+    return { pending: '待复核', approved: '已撤回替换', conflict: '冲突·保留直播', dismissed: '已取消' }[status];
+  }
+
+  private renderRecallApply() {
+    const segment = this.model.segments.find((item) => item.id === this.recallTargetId);
+    if (!segment) return nothing;
+    const existing = pendingRecallForSegment(this.model, segment.id);
+    const ageSeconds = Math.round((Date.now() - segment.confirmedAt!) / 1000);
+    return html`
+      <div class="recall-mask" @click=${(event: Event) => { if (event.target === event.currentTarget) this.recallModal = 'closed'; }}>
+        <div class="recall-dialog" role="dialog" aria-modal="true" aria-label="快速撤回申请">
+          <header class="recall-head">
+            <div>
+              <h3>${existing ? '更新撤回申请' : '快速撤回申请'}</h3>
+              <p>同一片段只保留一份待处理申请，再次提交会覆盖旧申请${existing ? '（沿用首次提交时间排队）' : ''}</p>
+            </div>
+            <cds-button kind="ghost" size="sm" @click=${() => { this.recallModal = 'closed'; }}>关闭</cds-button>
+          </header>
+          <div class="recall-body">
+            <div class="recall-meta-row">
+              <cds-tag type="red" size="sm">直播区错句</cds-tag>
+              <span>#${String(segment.sequence).padStart(3, '0')} · ${formatClock(segment.startTime)} · ${segment.speaker} · 已直播 ${ageSeconds} 秒</span>
+              <span class="recall-version">申请时锁定版本 v${segment.revision}</span>
+            </div>
+            <div class="recall-before">
+              <span>当前直播内容（撤回前）</span>
+              <p>${segment.corrected}</p>
+            </div>
+            <cds-textarea
+              class="recall-textarea"
+              label-text="替换文本（复核通过后回到同一时间位置）"
+              .value=${this.recallText}
+              @input=${(event: Event) => { this.recallText = (event.currentTarget as any).value; }}
+            ></cds-textarea>
+            <cds-textarea
+              class="recall-reason"
+              label-text="撤回原因"
+              placeholder="例如：专有名词写错 / 数字与口播不一致"
+              .value=${this.recallReason}
+              @input=${(event: Event) => { this.recallReason = (event.currentTarget as any).value; }}
+            ></cds-textarea>
+            <div class="recall-operator">
+              <cds-text-input label-text="申请人" .value=${this.model.operatorName} @input=${(event: Event) => { this.automatic({ ...this.model, operatorName: (event.currentTarget as any).value }); }}></cds-text-input>
+            </div>
+            ${this.model.connection === 'offline' ? html`
+              <div class="recall-conflict">当前处于断线状态，申请会暂存本地，恢复连接后按提交先后顺序进入复核队列。</div>
+            ` : nothing}
+            ${existing ? html`
+              <div class="recall-conflict keep">已有待处理申请（${formatAge(existing.requestedAt)}提交 · 原因：${existing.reason}），提交后将被本次内容覆盖。</div>
+            ` : nothing}
+          </div>
+          <footer class="recall-foot">
+            <span>申请需在 ${Math.round(RECALL_WINDOW_MS / 1000)} 秒内完成复核，超时将标记冲突并保留当前直播内容</span>
+            <div>
+              <cds-button kind="ghost" size="sm" @click=${() => { this.recallModal = 'closed'; }}>取消</cds-button>
+              <cds-button kind="primary" size="sm" @click=${this.submitRecallRequest}>${existing ? '覆盖并重新申请' : '提交撤回申请'}</cds-button>
+            </div>
+          </footer>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderRecallReview() {
+    const pending = this.model.recalls
+      .filter((item) => item.status === 'pending')
+      .sort((a, b) => a.requestedAt - b.requestedAt);
+    const history = this.model.recalls
+      .filter((item) => item.status !== 'pending')
+      .sort((a, b) => (b.reviewedAt ?? 0) - (a.reviewedAt ?? 0));
+    return html`
+      <div class="recall-mask" @click=${(event: Event) => { if (event.target === event.currentTarget) this.recallModal = 'closed'; }}>
+        <div class="recall-dialog recall-dialog-wide" role="dialog" aria-modal="true" aria-label="撤回复核">
+          <header class="recall-head">
+            <div>
+              <h3>撤回复核台</h3>
+              <p>断线期间提交的申请恢复后按提交先后排序；原句被改动、申请超 90 秒或片段已撤回时保留当前直播内容</p>
+            </div>
+            <cds-button kind="ghost" size="sm" @click=${() => { this.recallModal = 'closed'; }}>关闭</cds-button>
+          </header>
+          <div class="recall-body recall-review-body">
+            <section class="recall-review-section">
+              <h4>待处理申请 · ${pending.length} 份</h4>
+              ${pending.length ? pending.map((recall, index) => {
+                const conflict = recallConflict(this.model, recall);
+                const overdue = Date.now() - recall.requestedAt > RECALL_WINDOW_MS;
+                return html`
+                <article class="recall-card ${conflict ? 'conflict' : ''}">
+                  <div class="recall-card-head">
+                    <div class="recall-order">
+                      <span class="order-no">${index + 1}</span>
+                      <div>
+                        <strong>#${String(recall.sequence).padStart(3, '0')} · ${formatClock(recall.startTime)} · ${recall.speaker}</strong>
+                        <p>${recall.applicant} · ${formatAge(recall.requestedAt)}提交${recall.offline ? ' · 断线期间提交' : ''} · 锁定 v${recall.baseRevision}${overdue ? ' · 已超 90 秒' : ''}</p>
+                      </div>
+                    </div>
+                    <cds-tag type=${conflict ? 'red' : 'blue'} size="sm">${conflict ? '冲突' : '可复核'}</cds-tag>
+                  </div>
+                  <div class="recall-diff">
+                    <div class="diff-before"><span>撤回前（直播区旧句）</span><p>${recall.beforeText}</p></div>
+                    <div class="diff-arrow">→</div>
+                    <div class="diff-after"><span>替换后（回到原时间位置）</span><p>${recall.replacement}</p></div>
+                  </div>
+                  <div class="recall-reason-line"><strong>原因：</strong>${recall.reason}</div>
+                  ${conflict ? html`<div class="recall-conflict">复核冲突：${conflict}。本次不替换，保留当前直播内容。</div>` : nothing}
+                  <div class="recall-card-actions">
+                    <cds-text-input label-text="复核处理人" size="sm" .value=${this.reviewName} @input=${(event: Event) => { this.reviewName = (event.currentTarget as any).value; }}></cds-text-input>
+                    <div>
+                      <cds-button kind="danger--tertiary" size="sm" @click=${() => this.keepLiveContent(recall.id)}>保留当前直播内容</cds-button>
+                      <cds-button kind="primary" size="sm" ?disabled=${!!conflict} @click=${() => this.approveRecall(recall.id)}>通过撤回并替换</cds-button>
+                    </div>
+                  </div>
+                </article>
+              `;}) : html`<div class="recall-empty">暂无待处理的撤回申请。直播区发现错句时，可在时间线条目上点击“快速撤回”。</div>`}
+            </section>
+            <section class="recall-review-section">
+              <h4>撤回记录 · ${history.length} 条</h4>
+              ${history.length ? history.map((recall) => html`
+                <article class="recall-record ${recall.status}">
+                  <div class="recall-card-head">
+                    <div>
+                      <strong>#${String(recall.sequence).padStart(3, '0')} · ${formatClock(recall.startTime)} · ${recall.speaker}</strong>
+                      <p>${recall.applicant} 申请 · ${recall.reviewer || '复核员'} ${recall.status === 'approved' ? '通过' : '结案'}</p>
+                    </div>
+                    <cds-tag type=${recall.status === 'approved' ? 'green' : 'warm-gray'} size="sm">${this.recallStatusLabel(recall.status)}</cds-tag>
+                  </div>
+                  <div class="recall-diff small">
+                    <div class="diff-before"><span>前内容</span><p>${recall.beforeText}</p></div>
+                    <div class="diff-arrow">→</div>
+                    <div class="diff-after ${recall.status === 'approved' ? '' : 'kept'}"><span>${recall.status === 'approved' ? '后内容（替换生效）' : '当前直播内容（保留）'}</span><p>${recall.afterText ?? recall.replacement}</p></div>
+                  </div>
+                  ${recall.conflictReason ? html`<div class="recall-conflict">${recall.conflictReason}</div>` : nothing}
+                  <div class="recall-reason-line"><strong>原因：</strong>${recall.reason}${recall.reviewedAt ? ` · 处理于 ${new Date(recall.reviewedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : ''}</div>
+                </article>
+              `) : html`<div class="recall-empty">撤回通过或冲突结案后，旧句与新文本都会完整保留在这里。</div>`}
+            </section>
+          </div>
+        </div>
       </div>
     `;
   }
@@ -784,6 +1097,9 @@ export class CaptionDesk extends LitElement {
             </div>
           </div>
           <div class="header-actions">
+            <cds-button kind=${this.stats.recallPending > 0 ? 'primary' : 'ghost'} size="sm" @click=${this.openReview}>
+              撤回复核${this.stats.recallPending > 0 ? `（${this.stats.recallPending}）` : ''}
+            </cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.toggleTheme}>${this.dark ? '浅色界面' : '深色值守'}</cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.undo}>撤销</cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.redo}>重做</cds-button>
@@ -794,7 +1110,7 @@ export class CaptionDesk extends LitElement {
         <section class="status-strip">
           <div class="status-cell hero">
             <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
-            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline}</span>
+            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline} · 撤回待复核 ${stats.recallPending}</span>
             <div class="queue-track"><span style=${`width:${backlogRatio}%`}></span></div>
           </div>
           <div class="status-cell"><strong>${stats.pending}</strong><span>待确认片段</span></div>
@@ -860,6 +1176,9 @@ export class CaptionDesk extends LitElement {
             ></cds-toast-notification>
           `)}
         </div>
+
+        ${this.recallModal === 'apply' ? this.renderRecallApply() : nothing}
+        ${this.recallModal === 'review' ? this.renderRecallReview() : nothing}
       </div>
     `;
   }

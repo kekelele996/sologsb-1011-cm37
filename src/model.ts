@@ -1,6 +1,32 @@
 export type ConnectionState = 'connected' | 'degraded' | 'offline';
 export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
 export type SegmentSource = 'live' | 'offline' | 'manual';
+export type RecallStatus = 'pending' | 'approved' | 'conflict' | 'dismissed';
+
+export interface RecallRequest {
+  id: string;
+  segmentId: string;
+  sequence: number;
+  startTime: number;
+  speaker: string;
+  /** 申请时记下的字幕版本，用于检测申请后旧句是否又被修改 */
+  baseRevision: number;
+  /** 申请时直播区旧句（前内容快照） */
+  beforeText: string;
+  /** 替换文本（复核通过后的后内容） */
+  replacement: string;
+  reason: string;
+  applicant: string;
+  requestedAt: number;
+  /** 断线期间提交的申请，恢复后按 requestedAt 先后顺序复核 */
+  offline: boolean;
+  status: RecallStatus;
+  reviewer?: string;
+  reviewedAt?: number;
+  /** 处理后实际留在直播区的内容（通过时等于 replacement，冲突时为当前直播句） */
+  afterText?: string;
+  conflictReason?: string;
+}
 
 export interface CaptionSegment {
   id: string;
@@ -36,6 +62,8 @@ export interface DeskModel {
   eventDate: string;
   segments: CaptionSegment[];
   rules: TermRule[];
+  recalls: RecallRequest[];
+  operatorName: string;
   selectedId: string;
   connection: ConnectionState;
   simulatedDelay: number;
@@ -99,16 +127,54 @@ const duplicate: CaptionSegment = {
   staleReason: '与第 2 段高度相似',
 };
 
+const seededRecalls: RecallRequest[] = [
+  {
+    id: 'recall-1',
+    segmentId: 'seg-3',
+    sequence: 3,
+    startTime: 15,
+    speaker: '主讲人',
+    baseRevision: 0,
+    beforeText: '延迟和质量监测会帮助我们保持字幕稳定。',
+    replacement: '延迟和质量监控会帮助我们保持字幕稳定。',
+    reason: '“监测”应为“监控”，直播区仍挂着错句',
+    applicant: '值班校对 / 林岑',
+    requestedAt: now - 110_000,
+    offline: false,
+    status: 'pending',
+  },
+  {
+    id: 'recall-2',
+    segmentId: 'seg-1',
+    sequence: 1,
+    startTime: 0,
+    speaker: '主持人',
+    baseRevision: 0,
+    beforeText: '欢迎大家来到二零二六年产品发布会。',
+    replacement: '欢迎大家来到2026年秋季产品发布会。',
+    reason: '漏写“秋季”',
+    applicant: '值班校对 / 林岑',
+    requestedAt: now - 360_000,
+    offline: false,
+    status: 'approved',
+    reviewer: '复核 / 周然',
+    reviewedAt: now - 300_000,
+    afterText: '欢迎大家来到2026年产品发布会。',
+  },
+];
+
 export function createInitialModel(): DeskModel {
   return {
     eventName: '新品发布会现场字幕',
     eventDate: new Date(now).toISOString().slice(0, 10),
-    segments: [...seededSegments, duplicate],
+    segments: [...seededSegments.map((item) => item.id === 'seg-1' ? { ...item, revision: 1 } : item), duplicate],
     rules: [
       { id: 'term-1', source: 'co pilot', replacement: 'Co-Pilot', speaker: '', enabled: true, caseSensitive: false, usageCount: 4, createdAt: now - 86_400_000 },
       { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, createdAt: now - 43_200_000 },
       { id: 'term-3', source: '五G', replacement: '5G', speaker: '', enabled: true, caseSensitive: true, usageCount: 2, createdAt: now - 3_600_000 },
     ],
+    recalls: seededRecalls,
+    operatorName: '值班校对 / 林岑',
     selectedId: 'seg-4',
     connection: 'connected',
     simulatedDelay: 1.8,
@@ -226,11 +292,13 @@ export function queueStats(model: DeskModel) {
   const stale = model.segments.filter((item) => item.state === 'stale');
   const duplicate = model.segments.filter((item) => item.state === 'duplicate');
   const offline = model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed');
+  const recallPending = (model.recalls ?? []).filter((item) => item.status === 'pending').length;
   return {
     pending: pending.length,
     stale: stale.length,
     duplicate: duplicate.length,
     offline: offline.length,
+    recallPending,
     backlog: pending.length + stale.length + duplicate.length + offline.length,
     oldestWaitSeconds: pending.length ? Math.max(...pending.map((item) => Math.round((Date.now() - item.receivedAt) / 1000))) : 0,
   };
@@ -290,8 +358,131 @@ export function simulateLatency(model: DeskModel): DeskModel {
   };
 }
 
-export function toSrt(model: DeskModel): string {
-  const stamp = (seconds: number, separator = ',') => {
+// —— 快速撤回 ——
+
+export const RECALL_WINDOW_MS = 90_000;
+
+/** 同一片段只允许一份待处理撤回 */
+export function pendingRecallForSegment(model: DeskModel, segmentId: string): RecallRequest | undefined {
+  return (model.recalls ?? []).find((item) => item.segmentId === segmentId && item.status === 'pending');
+}
+
+/**
+ * 复核冲突检测：
+ * 1. 原句在申请后又改过（版本号变化）
+ * 2. 申请超过九十秒
+ * 3. 片段已撤回 / 已离开直播区（不再是已确认）
+ */
+export function recallConflict(model: DeskModel, recall: RecallRequest): string | undefined {
+  const segment = model.segments.find((item) => item.id === recall.segmentId);
+  if (!segment) return '该片段已不存在，无法定位撤回目标';
+  if (segment.state !== 'confirmed') return '该片段已不在直播区（可能已被撤回或移除）';
+  if (segment.corrected !== recall.beforeText) return `申请后原句又被修改（当前直播：${segment.corrected}）`;
+  if (segment.revision !== recall.baseRevision) return `字幕版本已变化（申请时 v${recall.baseRevision}，当前 v${segment.revision}）`;
+  if (Date.now() - recall.requestedAt > RECALL_WINDOW_MS) {
+    return `申请已超过 90 秒（实际等待 ${Math.round((Date.now() - recall.requestedAt) / 1000)} 秒）`;
+  }
+  return undefined;
+}
+
+export interface NewRecallInput {
+  segmentId: string;
+  replacement: string;
+  reason: string;
+  applicant: string;
+}
+
+export interface NewRecallResult {
+  model: DeskModel;
+  /** true 表示覆盖了同一片段上原有的待处理申请 */
+  replaced: boolean;
+}
+
+export function submitRecall(model: DeskModel, input: NewRecallInput): NewRecallResult {
+  const segment = model.segments.find((item) => item.id === input.segmentId);
+  if (!segment) return { model, replaced: false };
+  const nowTs = Date.now();
+  const existing = pendingRecallForSegment(model, segment.id);
+  // 已有申请若已处于不可复核的冲突状态（超时、原句改动、离开直播区），作为全新申请重新计时
+  const stale = existing ? !!recallConflict(model, existing) : true;
+  const offline = model.connection === 'offline';
+  const request: RecallRequest = {
+    id: `recall-${nowTs.toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    segmentId: segment.id,
+    sequence: segment.sequence,
+    startTime: segment.startTime,
+    speaker: segment.speaker,
+    baseRevision: segment.revision,
+    beforeText: segment.corrected,
+    replacement: input.replacement,
+    reason: input.reason,
+    applicant: input.applicant,
+    requestedAt: existing && !stale ? existing.requestedAt : nowTs,
+    offline: offline || (!stale && !!existing?.offline),
+    status: 'pending',
+  };
+  // 同一片段只留一份待处理：覆盖旧申请；有效申请沿用最早排队时间，保证离线恢复后按先后处理
+  const recalls = [...(model.recalls ?? []).filter((item) => item.id !== existing?.id), request]
+    .sort((a, b) => a.requestedAt - b.requestedAt);
+  return {
+    model: { ...model, recalls, updatedAt: nowTs },
+    replaced: !!existing,
+  };
+}
+
+/** 复核决定：通过则旧句转入撤回记录、新文本回到原时间位置；冲突则保留当前直播内容 */
+export function decideRecall(model: DeskModel, recallId: string, approve: boolean, reviewer: string): DeskModel {
+  const recall = (model.recalls ?? []).find((item) => item.id === recallId);
+  if (!recall || recall.status !== 'pending') return model;
+
+  const conflict = recallConflict(model, recall);
+  const reviewedAt = Date.now();
+  let segments = model.segments;
+
+  let next: RecallRequest;
+  if (approve && !conflict) {
+    segments = model.segments.map((item) => item.id === recall.segmentId ? {
+      ...item,
+      corrected: recall.replacement,
+      revision: item.revision + 1,
+      tags: [...new Set([...item.tags, `撤回替换 ${new Date(reviewedAt).toLocaleTimeString('zh-CN')}`])],
+    } : item);
+    next = { ...recall, status: 'approved', reviewer, reviewedAt, afterText: recall.replacement };
+  } else {
+    const segment = model.segments.find((item) => item.id === recall.segmentId);
+    const keptText = segment?.corrected ?? recall.beforeText;
+    next = {
+      ...recall,
+      // 通过时发现冲突记为 conflict；复核员主动拒绝记为 dismissed，二者都保留当前直播内容
+      status: approve ? 'conflict' : 'dismissed',
+      reviewer,
+      reviewedAt,
+      afterText: keptText,
+      conflictReason: approve
+        ? (conflict ?? '复核未通过')
+        : conflict
+          ? `拒绝撤回并保留当前直播内容；${conflict}`
+          : '复核员拒绝撤回，保留当前直播内容',
+    };
+  }
+
+  return {
+    ...model,
+    segments,
+    recalls: (model.recalls ?? []).map((item) => item.id === recallId ? next : item),
+    updatedAt: reviewedAt,
+  };
+}
+
+/** 恢复连接：断线期间提交的申请回到待复核队列，按提交时间先后处理 */
+export function requeueOfflineRecalls(model: DeskModel): DeskModel {
+  const recalls = (model.recalls ?? [])
+    .map((item) => item.status === 'pending' ? { ...item, offline: false } : item)
+    .sort((a, b) => (a.status === 'pending' && b.status === 'pending' ? a.requestedAt - b.requestedAt : 0));
+  return { ...model, recalls, updatedAt: Date.now() };
+}
+
+export function toSrt(model: DeskModel): string {  const stamp = (seconds: number, separator = ',') => {
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
     const secs = Math.floor(seconds % 60);
